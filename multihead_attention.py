@@ -1,74 +1,45 @@
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from transformer.Modules import ScaledDotProductAttention
 
 
 class MultiHeadAttention(nn.Module):
-    ''' Multi-Head Attention module '''
+    '''
+    input:
+        query --- [N, T_q, query_dim]
+        key --- [N, T_k, key_dim]
+    output:
+        out --- [N, T_q, num_units]
+    '''
 
-    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1):
+    def __init__(self, query_dim, key_dim, num_units, num_heads):
+
         super().__init__()
+        self.num_units = num_units
+        self.num_heads = num_heads
+        self.key_dim = key_dim
 
-        self.n_head = n_head
-        self.d_k = d_k
-        self.d_v = d_v
+        self.W_query = nn.Linear(in_features=query_dim, out_features=num_units, bias=False)
+        self.W_key = nn.Linear(in_features=key_dim, out_features=num_units, bias=False)
+        self.W_value = nn.Linear(in_features=key_dim, out_features=num_units, bias=False)
 
-        self.w_qs = nn.Linear(d_model, n_head * d_k)
-        self.w_ks = nn.Linear(d_model, n_head * d_k)
-        self.w_vs = nn.Linear(d_model, n_head * d_v)
-        nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
+    def forward(self, query, key):
+        querys = self.W_query(query)  # [N, T_q, num_units]
+        keys = self.W_key(key)  # [N, T_k, num_units]
+        values = self.W_value(key)
 
-        self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
-        self.layer_norm = nn.LayerNorm(d_model)
+        split_size = self.num_units // self.num_heads
+        querys = torch.stack(torch.split(querys, split_size, dim=2), dim=0)  # [h, N, T_q, num_units/h]
+        keys = torch.stack(torch.split(keys, split_size, dim=2), dim=0)  # [h, N, T_k, num_units/h]
+        values = torch.stack(torch.split(values, split_size, dim=2), dim=0)  # [h, N, T_k, num_units/h]
 
-        self.fc = nn.Linear(n_head * d_v, d_model)
-        nn.init.xavier_normal_(self.fc.weight)
+        # score = softmax(QK^T / (d_k ** 0.5))
+        scores = torch.matmul(querys, keys.transpose(2, 3))  # [h, N, T_q, T_k]
+        scores = scores / (self.key_dim ** 0.5)
+        scores = F.softmax(scores, dim=3)
 
-        self.dropout = nn.Dropout(dropout)
+        # out = score * V
+        out = torch.matmul(scores, values)  # [h, N, T_q, num_units/h]
+        out = torch.cat(torch.split(out, 1, dim=0), dim=3).squeeze(0)  # [N, T_q, num_units]
 
-
-    def forward(self, q, k, v, mask=None):
-        """
-        Inputs:
-            q : B x L X n_heads X D
-            k : B x L X n_heads X D
-            v : B x L X n_heads X D
-        """
-
-        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
-
-        sz_b, len_q, _ = q.size()
-        sz_b, len_k, _ = k.size()
-        sz_b, len_v, _ = v.size()
-
-        residual = q
-
-        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
-        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
-        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
-
-        q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k) # (n*b) x lq x dk
-        k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k, d_k) # (n*b) x lk x dk
-        v = v.permute(2, 0, 1, 3).contiguous().view(-1, len_v, d_v) # (n*b) x lv x dv
-
-        mask = mask.repeat(n_head, 1, 1) # (n*b) x .. x ..
-        output, attn = self.attention(q, k, v, mask=mask)
-
-        output = output.view(n_head, sz_b, len_q, d_v)
-        output = output.permute(1, 2, 0, 3).contiguous().view(sz_b, len_q, -1) # b x lq x (n*dv)
-
-        output = self.dropout(self.fc(output))
-        output = self.layer_norm(output + residual)
-
-        return output, attn
-
-
-
-        out = F.elu(self.conv(F.elu(out)))
-        out = F.sigmoid(self.conv2A(out)) * self.conv2B(out)
-        out = out.transpose(1, 2)
-        out += residual
         return out
